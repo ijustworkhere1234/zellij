@@ -12,12 +12,25 @@
 //! descriptor ceiling, then assert the session is still usable afterwards.
 
 use std::os::unix::net::UnixStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use zellij_integration_tests::fake_server_os_api::FakeServerOsApi;
+use zellij_integration_tests::test_env;
 use zellij_integration_tests::{
-    claim_first_terminal_and_wait_for_prompt, TestRunner, TERMINAL_SIZE,
+    claim_first_terminal_and_wait_for_prompt, default_timeout, TestRunner, TERMINAL_SIZE,
 };
 use zellij_utils::consts::ZELLIJ_SOCK_DIR;
+
+fn wait_for(what: &str, mut predicate: impl FnMut() -> bool) {
+    let deadline = Instant::now() + default_timeout();
+    while Instant::now() < deadline {
+        if predicate() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for: {}", what);
+}
 
 /// Holds the process at its file descriptor ceiling for as long as it is alive.
 ///
@@ -138,4 +151,45 @@ fn session_survives_a_failed_accept() {
 
     second_client.quit();
     zellij.quit();
+}
+
+#[test]
+fn server_survives_a_client_that_leaves_before_the_session_exists() {
+    test_env::init();
+    let session_name = test_env::unique_session_name();
+    let socket_path = ZELLIJ_SOCK_DIR.join(&session_name);
+    std::fs::create_dir_all(ZELLIJ_SOCK_DIR.as_path()).expect("could not create socket dir");
+
+    // Run the server on its own, with no client, so `session_data` stays None: it is only
+    // populated once a client completes the FirstClientConnected handshake.
+    let server = std::thread::Builder::new()
+        .name("in_process_zellij_server".to_string())
+        .spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                zellij_server::start_server_impl(
+                    Box::new(FakeServerOsApi::default()),
+                    socket_path,
+                    false,
+                );
+            }
+        })
+        .expect("could not spawn server thread");
+
+    wait_for("the server to bind its socket", || socket_path.exists());
+
+    // A client that connects and vanishes without ever completing the handshake. Its router
+    // thread gives up and sends ServerInstruction::RemoveClient, which the main loop handles
+    // while there is still no session to remove the client from.
+    drop(UnixStream::connect(&socket_path).expect("could not connect to the session socket"));
+
+    // The server must still be running. Before the fix the RemoveClient handler unwrapped the
+    // absent `session_data` and this thread panicked, which in a real server is a main-thread
+    // panic that calls process::exit(1) and takes every pane with it.
+    std::thread::sleep(Duration::from_millis(750));
+    assert!(
+        !server.is_finished(),
+        "the server loop died handling a RemoveClient for a client that left \
+         before the session was initialized"
+    );
 }
